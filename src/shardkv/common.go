@@ -60,15 +60,11 @@ type PutAppendReply struct {
 
 type TransferShardArgs struct {
 	// You'll have to add definitions here.
-	Cid int64
-	Seq int64
-	Gid int
 	Shards []int
 	ConfigNum int
 }
 
 type TransferShardReply struct {
-	WrongLeader bool
 	Err         Err
 	Transferred [shardmaster.NShards]map[string]string
 	ClientRequests map[int64]int64
@@ -76,14 +72,11 @@ type TransferShardReply struct {
 
 type ReConfigArgs struct {
 	// You'll have to add definitions here.
-	Cid int64
-	Seq int64
 	Kvs [shardmaster.NShards]map[string]string
 	ClientRequests map[int64]int64
 	NewConfig shardmaster.Config
 }
 
 type ReConfigReply struct {
-	WrongLeader bool
 	Err         Err
 }

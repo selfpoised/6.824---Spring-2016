@@ -56,9 +56,6 @@ type ShardKV struct {
 	cNotifyChan map[int]chan OpReply
 	mck       *shardmaster.Clerk
 	config   shardmaster.Config
-
-	// used as client information when sending install shards to other groups
-	cid,seq int64
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -139,48 +136,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf(fmt.Sprintf("Server %d:%d PutAppend %v with reply %v",kv.gid,kv.me,*args, *reply))
 }
 
-func (kv *ShardKV) TransferShard(args *TransferShardArgs, reply *TransferShardReply) {
-	op := Op{Action:Transfer,Args:*args}
-
-	reply.WrongLeader = true
-	reply.Err = ""
-
-	index,_,isLeader := kv.rf.Start(op)
-	if isLeader {
-		var channel chan OpReply
-		kv.mu.Lock()
-		_,ok := kv.cNotifyChan[index]
-		if !ok{
-			kv.cNotifyChan[index] = make(chan OpReply, 1)
-		}
-		channel = kv.cNotifyChan[index]
-		kv.mu.Unlock()
-
-		select{
-		case rep := <- channel:
-			if recArgs,ok := rep.Args.(TransferShardArgs); ok{
-				if recArgs.Cid == args.Cid && recArgs.Seq == args.Seq{
-					*reply = rep.Reply.(TransferShardReply)
-				}else{
-					reply.Err = Error
-				}
-			}
-		case <-time.After(200*time.Millisecond):
-			reply.Err = TimeOut
-		}
-	}
-
-	kv.mu.Lock()
-	delete(kv.cNotifyChan, index)
-	kv.mu.Unlock()
-
-	DPrintf(fmt.Sprintf("Server %d:%d TransferShard %v with reply %v",kv.gid,kv.me,*args, *reply))
-}
-
 func (kv *ShardKV) ReConfig(args *ReConfigArgs, reply *ReConfigReply) {
 	op := Op{Action:ReConfig,Args:*args}
 
-	reply.WrongLeader = true
 	reply.Err = ""
 
 	index,_,isLeader := kv.rf.Start(op)
@@ -198,8 +156,7 @@ func (kv *ShardKV) ReConfig(args *ReConfigArgs, reply *ReConfigReply) {
 		case rep := <- channel:
 			if recArgs,ok := rep.Args.(ReConfigArgs); ok{
 				if recArgs.NewConfig.Num == args.NewConfig.Num{
-					reply.Err = rep.Reply.(ReConfigReply).Err
-					reply.WrongLeader = false
+					reply.Err = OK
 				}else{
 					reply.Err = Error
 				}
@@ -291,8 +248,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.cNotifyChan = make(map[int]chan OpReply)
 	kv.cRequests = make(map[int64]int64)
 	kv.mck = shardmaster.MakeClerk(masters)
-	kv.cid = nrand()
-	kv.seq = 0
 
 	go kv.configDaemon()
 	go kv.workerDaemon()
@@ -310,7 +265,7 @@ func (kv *ShardKV) configDaemon(){
 				// get diff and prepare reconfig
 				args,ok := kv.prepareReConfig(newConfig)
 				if ok {
-					if !kv.StartReConfig(args){
+					if !kv.syncConfig(args){
 						break
 					}
 				}else{
@@ -358,12 +313,6 @@ func (kv *ShardKV) prepareReConfig(newConfig shardmaster.Config) (ReConfigArgs,b
 			defer waitGroup.Done()
 
 			var args TransferShardArgs
-			//kv.mu.Lock()
-			//args.Cid = kv.cid
-			//kv.seq++
-			//args.Seq = kv.seq
-			//kv.mu.Unlock()
-			args.Gid = gid
 			args.Shards = shards
 			args.ConfigNum = newConfig.Num
 
@@ -373,8 +322,8 @@ func (kv *ShardKV) prepareReConfig(newConfig shardmaster.Config) (ReConfigArgs,b
 
 				var reply TransferShardReply
 
-				ok := srv.Call("ShardKV.TransferShard2", &args, &reply)
-				if ok && reply.WrongLeader == false && reply.Err == OK {
+				ok := srv.Call("ShardKV.FetchShards", &args, &reply)
+				if ok && reply.Err == OK {
 					mutex.Lock()
 					for shard,kvs := range reply.Transferred{
 						for k,v := range kvs{
@@ -408,17 +357,15 @@ func (kv *ShardKV) prepareReConfig(newConfig shardmaster.Config) (ReConfigArgs,b
 	return reConfigArgs,retOk
 }
 
-func (kv *ShardKV) TransferShard2(args *TransferShardArgs, reply *TransferShardReply) {
+func (kv *ShardKV) FetchShards(args *TransferShardArgs, reply *TransferShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if kv.config.Num < args.ConfigNum{
 		reply.Err = NotReady
-		reply.WrongLeader = true
 		return
 	}
 
-	reply.WrongLeader = false
 	reply.Err = OK
 
 	reply.ClientRequests = make(map[int64]int64)
@@ -438,17 +385,11 @@ func (kv *ShardKV) TransferShard2(args *TransferShardArgs, reply *TransferShardR
 	}
 }
 
-func (kv *ShardKV) StartReConfig(args ReConfigArgs) bool{
-	args.Cid = kv.cid
-	kv.mu.Lock()
-	kv.seq++
-	args.Seq = kv.seq
-	kv.mu.Unlock()
-
+func (kv *ShardKV) syncConfig(args ReConfigArgs) bool{
 	var reply ReConfigReply
 	kv.ReConfig(&args, &reply)
 
-	return reply.WrongLeader == false && reply.Err == OK
+	return reply.Err == OK
 }
 
 func (kv *ShardKV) workerDaemon(){
@@ -501,8 +442,6 @@ func (kv *ShardKV) doCommand(msg *Op, index int){
 		kv.doAppend(msg,opReply)
 	}else if msg.Action == ReConfig {
 		kv.doReConfig(msg,opReply)
-	}else if msg.Action == Transfer {
-		kv.doTransfer(msg,opReply)
 	}else{}
 
 	// send msg to wake up client wait
@@ -584,12 +523,10 @@ func (kv *ShardKV) doAppend(msg *Op, reply *OpReply){
 }
 
 func (kv *ShardKV) doReConfig(msg *Op, reply *OpReply){
-	response := ReConfigReply{WrongLeader:true,Err:Error}
+	response := ReConfigReply{Err:Error}
 
 	if args,ok := msg.Args.(ReConfigArgs);ok{
-		//if args.NewConfig.Num > kv.config.Num && kv.validRequests(args.Cid,args.Seq){
 		if args.NewConfig.Num > kv.config.Num{
-			response.WrongLeader = false
 			response.Err = OK
 
 			for shard,data := range args.Kvs{
@@ -608,46 +545,7 @@ func (kv *ShardKV) doReConfig(msg *Op, reply *OpReply){
 				}
 			}
 
-			kv.cRequests[args.Cid] = args.Seq
-
 			kv.config = args.NewConfig
-		}
-	}
-
-	reply.Reply = response
-}
-
-func (kv *ShardKV) doTransfer(msg *Op, reply *OpReply){
-	response := TransferShardReply{WrongLeader:true,Err:Error}
-
-	if args,ok := msg.Args.(TransferShardArgs);ok{
-		if args.Gid != kv.gid{
-			response.Err = ErrWrongGroup
-		} else if kv.config.Num < args.ConfigNum{
-			response.Err = NotReady
-		} else{
-			if kv.validRequests(args.Cid,args.Seq){
-				response.WrongLeader = false
-				response.Err = OK
-
-				response.ClientRequests = make(map[int64]int64)
-				response.Transferred = [shardmaster.NShards]map[string]string{}
-				for i := range response.Transferred {
-					response.Transferred[i] = make(map[string]string)
-				}
-
-				for _,shard := range args.Shards{
-					for k,v := range kv.kvs[shard]{
-						response.Transferred[shard][k] = v
-					}
-				}
-
-				for c,s := range kv.cRequests{
-					response.ClientRequests[c] = s
-				}
-
-				kv.cRequests[args.Cid] = args.Seq
-			}
 		}
 	}
 

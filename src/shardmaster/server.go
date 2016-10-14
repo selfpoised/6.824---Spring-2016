@@ -8,7 +8,8 @@ import (
 	"fmt"
 	"time"
 	"log"
-	"sort"
+	"runtime/debug"
+	"os"
 )
 
 const Debug = 0
@@ -268,23 +269,79 @@ func (sm *ShardMaster) execute(msg *Op, index int){
 	sm.mu.Unlock()
 }
 
+func (sm *ShardMaster) shardsCount(config *Config) map[int][]int{
+	shardsCount := map[int][]int{}
+	for k := range config.Groups {
+		shardsCount[k] = []int{}
+	}
+	for k, v := range config.Shards {
+		shardsCount[v] = append(shardsCount[v], k)
+	}
+	return shardsCount
+}
+
+func (sm *ShardMaster) gidOfMostShards(shardsCount map[int][]int) int{
+	max := -1
+	gid := 0
+
+	for g, shards := range shardsCount{
+		if max < len(shards){
+			max = len(shards)
+			gid = g
+		}
+	}
+
+	return gid
+}
+
+func (sm *ShardMaster) gidOfLeastShards(shardsCount map[int][]int) int{
+	min := -1
+	gid := 0
+
+	for g, shards := range shardsCount{
+		if min == -1 || min > len(shards){
+			min = len(shards)
+			gid = g
+		}
+	}
+
+	return gid
+}
+
+func (sm *ShardMaster) rebalance(config *Config, action string, gid int){
+	shardsCount := sm.shardsCount(config)
+	switch action {
+	case "join":
+		mean := NShards / len(config.Groups)
+		for i:=0;i<mean;i++{
+			maxGid := sm.gidOfMostShards(shardsCount)
+			if len(shardsCount[maxGid]) == 0 {
+				log.Println("ReBalanceShards: max gid does not have shards")
+				debug.PrintStack()
+				os.Exit(-1)
+			}
+			config.Shards[shardsCount[maxGid][0]] = gid
+			shardsCount[maxGid] = shardsCount[maxGid][1:]
+		}
+	case "leave":
+		delShards := shardsCount[gid]
+		delete(shardsCount, gid)
+		for _,shard := range delShards{
+			minGid := sm.gidOfLeastShards(shardsCount)
+			config.Shards[shard] = minGid
+			shardsCount[minGid] = append(shardsCount[minGid],shard)
+		}
+	}
+}
+
 func (sm *ShardMaster) doJoin(msg *Op){
 	config := sm.newConfig()
 
-	for k,v := range msg.Servers{
-		config.Groups[k] = v
-	}
-
-	var gids []int
-	for k := range config.Groups{
-		gids = append(gids,k)
-	}
-	sort.Ints(gids)
-
-	numGroups := len(gids)
-	for i := range config.Shards{
-		m := i % numGroups
-		config.Shards[i] = gids[m]
+	for gid,servers := range msg.Servers{
+		if _,exist := config.Groups[gid];!exist{
+			config.Groups[gid] = servers
+			sm.rebalance(config, "join", gid)
+		}
 	}
 
 	sm.configs = append(sm.configs, *config)
@@ -293,21 +350,11 @@ func (sm *ShardMaster) doJoin(msg *Op){
 func (sm *ShardMaster) doLeave(msg *Op){
 	config := sm.newConfig()
 
-	for _,g:= range msg.GIDs {
-		delete(config.Groups, g)
-	}
-
-	var gids []int
-	for g := range config.Groups{
-		gids = append(gids, g)
-	}
-	sort.Ints(gids)
-
-	numGroups := len(gids)
-
-	for i := range config.Shards{
-		m := i % numGroups
-		config.Shards[i] = gids[m]
+	for _,gid:= range msg.GIDs {
+		if _,exist := config.Groups[gid];exist{
+			delete(config.Groups, gid)
+			sm.rebalance(config, "leave", gid)
+		}
 	}
 
 	sm.configs = append(sm.configs, *config)

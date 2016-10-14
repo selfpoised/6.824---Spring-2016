@@ -1,5 +1,7 @@
 package shardkv
 
+import "shardmaster"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running op-at-a-time paxos.
@@ -14,9 +16,29 @@ const (
 	ErrNoKey      = "ErrNoKey"
 	ErrWrongGroup = "ErrWrongGroup"
 	TimeOut       = "TimeOut"
+	Error         = "Error"
+	Get	      = "Get"
+	Put	      = "Put"
+	Append	      = "Append"
+	Transfer      = "Transfer"
+	ReConfig      = "ReConfig"
+	NotReady      = "NotReady"
 )
 
 type Err string
+
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+	Cid int64
+	Seq int64
+}
+
+type GetReply struct {
+	WrongLeader bool
+	Err         Err
+	Value       string
+}
 
 // Put or Append
 type PutAppendArgs struct {
@@ -29,8 +51,6 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	Cid int64
 	Seq int64
-	Gid int
-	Shard int
 }
 
 type PutAppendReply struct {
@@ -38,17 +58,32 @@ type PutAppendReply struct {
 	Err         Err
 }
 
-type GetArgs struct {
-	Key string
+type TransferShardArgs struct {
 	// You'll have to add definitions here.
 	Cid int64
 	Seq int64
 	Gid int
-	Shard int
+	Shards []int
+	ConfigNum int
 }
 
-type GetReply struct {
+type TransferShardReply struct {
 	WrongLeader bool
 	Err         Err
-	Value       string
+	Transferred [shardmaster.NShards]map[string]string
+	ClientRequests map[int64]int64
+}
+
+type ReConfigArgs struct {
+	// You'll have to add definitions here.
+	Cid int64
+	Seq int64
+	Kvs [shardmaster.NShards]map[string]string
+	ClientRequests map[int64]int64
+	NewConfig shardmaster.Config
+}
+
+type ReConfigReply struct {
+	WrongLeader bool
+	Err         Err
 }
